@@ -1,0 +1,9 @@
+# 本地运行（未设置 QUOTA_DB_PATH）时生成的 SQLite 数据文件
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/

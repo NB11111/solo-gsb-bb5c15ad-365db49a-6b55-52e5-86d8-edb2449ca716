@@ -33,14 +33,16 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_bucket_ts
 
 -- 幂等表：request_id 首次出现时固化载荷哈希与判定结果
 -- release_id 非空表示该消费已被对应释放单成功释放
+-- adjustment_id 非空表示该消费最近一次成功调整单（释放时撤销调整后的贡献）
 CREATE TABLE IF NOT EXISTS requests (
-    request_id   TEXT PRIMARY KEY,
-    payload_hash TEXT    NOT NULL,
-    payload      TEXT    NOT NULL,
-    decision     TEXT    NOT NULL,
-    allowed      INTEGER NOT NULL,
-    release_id   TEXT,
-    created_at   REAL    NOT NULL
+    request_id    TEXT PRIMARY KEY,
+    payload_hash  TEXT    NOT NULL,
+    payload       TEXT    NOT NULL,
+    decision      TEXT    NOT NULL,
+    allowed       INTEGER NOT NULL,
+    release_id    TEXT,
+    adjustment_id TEXT,
+    created_at    REAL    NOT NULL
 );
 
 -- 释放幂等表：release_id 首次成功释放时固化目标 request_id 与释放结果
@@ -49,6 +51,17 @@ CREATE TABLE IF NOT EXISTS releases (
     request_id  TEXT    NOT NULL,
     result      TEXT    NOT NULL,
     created_at  REAL    NOT NULL
+);
+
+-- 调整幂等表：adjustment_id 首次成功调整时固化目标 request_id、
+-- 载荷哈希、目标桶列表与调整结果；同一消费允许多次调整
+CREATE TABLE IF NOT EXISTS adjustments (
+    adjustment_id TEXT PRIMARY KEY,
+    request_id    TEXT    NOT NULL,
+    payload_hash  TEXT    NOT NULL,
+    buckets       TEXT    NOT NULL,
+    result        TEXT    NOT NULL,
+    created_at    REAL    NOT NULL
 );
 
 -- 哈希审计链：仅追加。seq 全局递增，首条 prev_hash 为 64 个 0，
@@ -65,12 +78,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 """
 
-# 旧库增量迁移：为已存在的 requests 表补充 release_id 列
+# 旧库增量迁移：为已存在的 requests 表补充 release_id / adjustment_id 列
 _MIGRATIONS = (
     (
         "requests",
         "release_id",
         "ALTER TABLE requests ADD COLUMN release_id TEXT",
+    ),
+    (
+        "requests",
+        "adjustment_id",
+        "ALTER TABLE requests ADD COLUMN adjustment_id TEXT",
     ),
 )
 

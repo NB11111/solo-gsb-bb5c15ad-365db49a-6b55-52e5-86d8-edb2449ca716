@@ -445,6 +445,499 @@ def test_release_validation_errors():
     assert r.status_code == 422
 
 
+# ---------------------------------------------------------------- 调整接口
+
+def _adjust(adj_id: str, rid: str, buckets):
+    return client.post("/v1/quota/adjustments", json={
+        "adjustment_id": adj_id, "request_id": rid, "buckets": buckets,
+    })
+
+
+def test_adjust_moves_contribution_between_buckets():
+    """成功调整：原桶贡献消失，目标桶出现等额（可不同额）贡献。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 6).status_code == 200
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 6
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 0
+
+    adj = _rid()
+    r = _adjust(adj, rid, [{"key": k2, "amount": 4}])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["adjusted"] is True
+    assert body["adjustment_id"] == adj and body["request_id"] == rid
+    assert body["granted"] == [{"key": k2, "amount": 4}]
+    assert body["previous_buckets"] == [{"key": k1, "amount": 6}]
+    assert body["events_replaced"] == 1
+    assert "X-Idempotent-Replay" not in r.headers
+
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 4
+
+
+def test_adjust_same_bucket_excludes_own_contribution():
+    """在同一桶上调整：校验时先排除自身原贡献，不会把自己算进占用。"""
+    key = _bucket(10, 60)
+    rid_other, rid = _rid(), _rid()
+    assert _consume(rid_other, key, 5).status_code == 200
+    assert _consume(rid, key, 4).status_code == 200  # 总占用 9
+
+    # 排除自身 4 后他人占 5；自身改成 5 → 5+5=10，恰好放行
+    r = _adjust(_rid(), rid, [{"key": key, "amount": 5}])
+    assert r.status_code == 200
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 10
+
+    # 改成 6 → 5+6=11 超限：429，贡献保持为 5
+    r = _adjust(_rid(), rid, [{"key": key, "amount": 6}])
+    assert r.status_code == 429
+    body = r.json()
+    assert body["adjusted"] is False
+    assert body["limited_buckets"][0]["key"] == key
+    assert body["limited_buckets"][0]["used"] == 5
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 10
+
+
+def test_adjust_over_limit_keeps_original_contribution():
+    """目标桶超限 → 429；所有原桶贡献保持不变，且返回受限桶信息。"""
+    k1, k2 = _bucket(10, 60), _bucket(3, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 4).status_code == 200
+    # 另一笔占用 k2 2 单位
+    assert _consume(_rid(), k2, 2).status_code == 200
+
+    r = _adjust(_rid(), rid, [{"key": k2, "amount": 2}])  # 2+2=4 > 3
+    assert r.status_code == 429
+    assert "Retry-After" in r.headers
+    body = r.json()
+    assert body["adjusted"] is False
+    lb = body["limited_buckets"][0]
+    assert lb["key"] == k2 and lb["used"] == 2 and lb["requested"] == 2
+    assert lb["limit"] == 3
+    # 原贡献不变
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 4
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 2
+
+
+def test_adjust_request_amount_over_limit_is_not_retryable():
+    """目标额本身超过桶限额 → retry_at 为 null，且原贡献不变。"""
+    k1, k2 = _bucket(10, 60), _bucket(3, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 1).status_code == 200
+    r = _adjust(_rid(), rid, [{"key": k2, "amount": 4}])
+    assert r.status_code == 429
+    assert r.json()["retry_at"] is None
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 1
+
+
+def test_adjust_unknown_target_bucket_404_keeps_contribution():
+    """目标列表含未知桶 → 404，原贡献保持不变。"""
+    key = _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, key, 2).status_code == 200
+    r = _adjust(_rid(), rid, [{"key": f"ghost-{_rid()[:8]}", "amount": 1}])
+    assert r.status_code == 404
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 2
+
+
+def test_adjust_multi_bucket_atomic_all_or_nothing():
+    """多目标桶任一超限：全部不替换，所有原贡献保持不变。"""
+    k1, k2, k3 = _bucket(10, 60), _bucket(10, 60), _bucket(2, 60)
+    rid = _rid()
+    r = client.post("/v1/quota/consume", json={
+        "request_id": rid,
+        "buckets": [{"key": k1, "amount": 3}, {"key": k2, "amount": 3}],
+    })
+    assert r.status_code == 200
+
+    r = _adjust(_rid(), rid, [
+        {"key": k2, "amount": 1},   # 可行
+        {"key": k3, "amount": 3},   # 请求量超 k3 限额
+    ])
+    assert r.status_code == 429
+    # k1/k2 原贡献保持，k3 未被写入
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 3
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 3
+    assert client.get(f"/v1/buckets/{k3}/usage").json()["used"] == 0
+
+
+def test_adjust_multi_bucket_success_replaces_all():
+    """多目标桶全部通过：原多桶贡献原子替换到新的多桶集合。"""
+    k1, k2, k3, k4 = (_bucket(10, 60) for _ in range(4))
+    rid = _rid()
+    r = client.post("/v1/quota/consume", json={
+        "request_id": rid,
+        "buckets": [{"key": k1, "amount": 2}, {"key": k2, "amount": 3}],
+    })
+    assert r.status_code == 200
+
+    r = _adjust(_rid(), rid, [
+        {"key": k3, "amount": 1}, {"key": k4, "amount": 4},
+    ])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["events_replaced"] == 2
+    expected_prev = sorted(
+        [{"key": k1, "amount": 2}, {"key": k2, "amount": 3}],
+        key=lambda b: b["key"],
+    )
+    assert sorted(body["previous_buckets"], key=lambda b: b["key"]) == expected_prev
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k3}/usage").json()["used"] == 1
+    assert client.get(f"/v1/buckets/{k4}/usage").json()["used"] == 4
+
+
+def test_adjust_idempotent_replay():
+    """相同 adjustment_id + 相同 request_id/载荷重放：原样返回，不再改动。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 3).status_code == 200
+    adj = _rid()
+    payload = [{"key": k2, "amount": 2}]
+
+    r1 = _adjust(adj, rid, payload)
+    assert r1.status_code == 200
+    # 再制造一笔 k2 占用，重放调整不应删除/影响它
+    assert _consume(_rid(), k2, 5).status_code == 200
+
+    r2 = _adjust(adj, rid, payload)
+    assert r2.status_code == 200
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+    assert r2.json() == r1.json()
+    # k2 = 2(调整后贡献) + 5(新消费)
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 7
+
+
+def test_adjust_changed_payload_conflict():
+    """相同 adjustment_id 改换目标桶列表 → 409，当前贡献不变。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 2).status_code == 200
+    adj = _rid()
+    assert _adjust(adj, rid, [{"key": k2, "amount": 2}]).status_code == 200
+
+    r = _adjust(adj, rid, [{"key": k2, "amount": 3}])
+    assert r.status_code == 409
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 2
+
+
+def test_adjust_changed_request_conflict():
+    """相同 adjustment_id 改指其他 request_id → 409。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid1, rid2 = _rid(), _rid()
+    assert _consume(rid1, k1, 1).status_code == 200
+    assert _consume(rid2, k1, 1).status_code == 200
+    adj = _rid()
+    assert _adjust(adj, rid1, [{"key": k2, "amount": 1}]).status_code == 200
+
+    r = _adjust(adj, rid2, [{"key": k2, "amount": 1}])
+    assert r.status_code == 409
+    # rid2 仍在 k1，未被改挂
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 1
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 1
+
+
+def test_adjust_unknown_request_404():
+    r = _adjust(_rid(), f"missing-{_rid()}", [{"key": "seeded", "amount": 1}])
+    assert r.status_code == 404
+
+
+def test_adjust_denied_request_conflict():
+    """原判定为拒绝的消费没有贡献，不可调整 → 409。"""
+    key = _bucket(1, 60)
+    assert _consume(_rid(), key, 1).status_code == 200
+    rid = _rid()
+    assert _consume(rid, key, 1).status_code == 429
+    r = _adjust(_rid(), rid, [{"key": key, "amount": 1}])
+    assert r.status_code == 409
+
+
+def test_adjust_after_release_conflict():
+    """已释放消费不可再调整 → 409。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 2).status_code == 200
+    assert _release(_rid(), rid).status_code == 200
+    r = _adjust(_rid(), rid, [{"key": k2, "amount": 1}])
+    assert r.status_code == 409
+
+
+def test_chained_adjustments_replace_latest_contribution():
+    """同一消费可多次调整；每次基于最近一次贡献，释放撤销最终贡献。"""
+    k1, k2, k3 = _bucket(10, 60), _bucket(10, 60), _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 4).status_code == 200
+
+    r1 = _adjust(_rid(), rid, [{"key": k2, "amount": 3}])
+    assert r1.status_code == 200
+    assert r1.json()["previous_buckets"] == [{"key": k1, "amount": 4}]
+    r2 = _adjust(_rid(), rid, [{"key": k3, "amount": 2}])
+    assert r2.status_code == 200
+    assert r2.json()["previous_buckets"] == [{"key": k2, "amount": 3}]
+    assert r2.json()["events_replaced"] == 1
+
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k3}/usage").json()["used"] == 2
+
+    rr = _release(_rid(), rid)
+    assert rr.status_code == 200
+    assert rr.json()["released_buckets"] == [{"key": k3, "amount": 2}]
+    assert rr.json()["adjusted"] is True
+    assert client.get(f"/v1/buckets/{k3}/usage").json()["used"] == 0
+
+
+def test_release_after_adjustment_undoes_adjusted_contribution():
+    """调整后释放：撤销的是调整后目标桶贡献，原桶不受影响也不被恢复。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 4).status_code == 200
+    assert _consume(_rid(), k1, 3).status_code == 200  # 他人在 k1 的占用
+    assert _adjust(_rid(), rid, [{"key": k2, "amount": 2}]).status_code == 200
+
+    rr = _release(_rid(), rid)
+    assert rr.status_code == 200
+    assert rr.json()["released_buckets"] == [{"key": k2, "amount": 2}]
+    assert rr.json()["events_reverted"] == 1
+    assert rr.json()["adjusted"] is True
+    # k2 调整贡献被撤销；k1 仅余他人 3（原 4 不会因释放而"回来"）
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 3
+
+
+def test_consume_replay_after_adjust_and_release_no_rededuction():
+    """调整→释放后重放原 consume：返回首次固化判定，不重新扣减。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid = _rid()
+    payload = {"request_id": rid, "buckets": [{"key": k1, "amount": 5}]}
+    r1 = client.post("/v1/quota/consume", json=payload)
+    assert r1.status_code == 200
+    assert _adjust(_rid(), rid, [{"key": k2, "amount": 5}]).status_code == 200
+    assert _release(_rid(), rid).status_code == 200
+
+    r2 = client.post("/v1/quota/consume", json=payload)
+    assert r2.status_code == 200
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+    assert r2.json() == r1.json()
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 0
+
+
+def test_adjust_frees_original_capacity_for_others():
+    """调整移走贡献后，原桶恢复出的额度可供新消费使用。"""
+    k1, k2 = _bucket(3, 60), _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 3).status_code == 200
+    assert _consume(_rid(), k1, 1).status_code == 429
+    assert _adjust(_rid(), rid, [{"key": k2, "amount": 3}]).status_code == 200
+    assert _consume(_rid(), k1, 3).status_code == 200
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 3
+
+
+def test_adjust_denial_not_persisted_same_id_can_succeed_later():
+    """429 调整不固化：窗口滚动后同一 adjustment_id 可成功。"""
+    k1, k2 = _bucket(5, 60), _bucket(1, 0.4)
+    rid = _rid()
+    assert _consume(rid, k1, 1).status_code == 200
+    assert _consume(_rid(), k2, 1).status_code == 200  # 暂时占满 k2
+
+    adj = _rid()
+    assert _adjust(adj, rid, [{"key": k2, "amount": 1}]).status_code == 429
+    # 原贡献仍在 k1
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 1
+    time.sleep(0.5)  # 等 k2 窗口滚动释放
+    r = _adjust(adj, rid, [{"key": k2, "amount": 1}])
+    assert r.status_code == 200
+    assert "X-Idempotent-Replay" not in r.headers
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 1
+
+
+def test_concurrent_adjustments_same_request_serialize():
+    """同一消费并发不同 adjustment_id 调整到不同桶：串行化，每次只保留最新贡献。
+
+    各目标桶额度充足，因此所有调整都应成功；最终落在最后提交的目标桶上，
+    中间桶不残留该请求事件。
+    """
+    targets = [_bucket(100, 60) for _ in range(5)]
+    src = _bucket(100, 60)
+    rid = _rid()
+    assert _consume(rid, src, 1).status_code == 200
+
+    outcomes = []
+
+    def hit(k):
+        outcomes.append((k, _adjust(_rid(), rid, [{"key": k, "amount": 1}]).status_code))
+
+    threads = [threading.Thread(target=hit, args=(k,)) for k in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(code == 200 for _, code in outcomes), outcomes
+    assert client.get(f"/v1/buckets/{src}/usage").json()["used"] == 0
+    # 恰好一个目标桶持有该请求的 1 单位贡献，其余目标桶为 0
+    usages = [client.get(f"/v1/buckets/{k}/usage").json()["used"] for k in targets]
+    assert sorted(usages) == [0, 0, 0, 0, 1]
+
+
+def test_concurrent_adjustments_contend_never_exceed_limit():
+    """多个已占满各自桶的请求并发调整到同一紧俏桶：超限额者 429 且原贡献不变。
+
+    目标桶限额 3，5 个请求各带 1 单位从独立源桶并发改挂：恰好 3 个成功，
+    落败者 429 且其源桶贡献保持为 1（总量守恒，绝不超限）。
+    """
+    dst = _bucket(3, 60)
+    srcs = [_bucket(10, 60) for _ in range(5)]
+    rids = []
+    for s in srcs:
+        rid = _rid()
+        rids.append(rid)
+        assert _consume(rid, s, 1).status_code == 200
+
+    codes = []
+    barrier = threading.Barrier(5)
+
+    def hit(rid):
+        barrier.wait()
+        codes.append(_adjust(_rid(), rid, [{"key": dst, "amount": 1}]).status_code)
+
+    threads = [threading.Thread(target=hit, args=(rid,)) for rid in rids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert codes.count(200) == 3, codes
+    assert codes.count(429) == 2, codes
+    assert client.get(f"/v1/buckets/{dst}/usage").json()["used"] == 3
+    # 每个落败请求的源桶贡献保持 1；成功请求源桶为 0
+    src_used = [client.get(f"/v1/buckets/{s}/usage").json()["used"] for s in srcs]
+    assert sorted(src_used) == [0, 0, 0, 1, 1]
+    # 全系统用量守恒：3(目标桶) + 2(滞留源桶) = 5
+    assert client.get(f"/v1/buckets/{dst}/usage").json()["used"] + sum(src_used) == 5
+
+
+def test_concurrent_same_adjustment_id_single_application():
+    """同一 adjustment_id + 同一载荷并发：全部 200，只应用一次调整/审计。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 2).status_code == 200
+    adj = _rid()
+    payload = [{"key": k2, "amount": 2}]
+    codes = []
+    barrier = threading.Barrier(15)
+
+    def hit():
+        barrier.wait()
+        codes.append(_adjust(adj, rid, payload).status_code)
+
+    threads = [threading.Thread(target=hit) for _ in range(15)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(c == 200 for c in codes)
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 2
+
+
+def test_concurrent_adjust_and_release():
+    """调整与释放并发作用于同一消费：恰好一方生效，用量不出现重复/丢失。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 3).status_code == 200
+    adj, rel = _rid(), _rid()
+    outcome = {}
+    barrier = threading.Barrier(2)
+
+    def do_adjust():
+        barrier.wait()
+        outcome["adjust"] = _adjust(adj, rid, [{"key": k2, "amount": 3}]).status_code
+
+    def do_release():
+        barrier.wait()
+        outcome["release"] = _release(rel, rid).status_code
+
+    t1 = threading.Thread(target=do_adjust)
+    t2 = threading.Thread(target=do_release)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    assert outcome["release"] == 200
+    assert set(outcome) == {"adjust", "release"}
+    # 释放一定成功（撤销当前生效贡献）；调整视提交先后成功或 409
+    if outcome["adjust"] == 200:
+        # 调整先：最终贡献在 k2，随后被释放 → 两桶皆 0
+        assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+        assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 0
+    else:
+        # 释放先：调整 409，原 k1 贡献已被释放 → 两桶皆 0
+        assert outcome["adjust"] == 409
+        assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+        assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 0
+    # 任何顺序下都不可再释放
+    assert _release(_rid(), rid).status_code == 409
+
+
+def test_adjust_audit_appended_once_on_success():
+    """仅首次成功调整记一条 adjustment/adjusted 审计；重放、429、404、409 不记录。"""
+    before = client.get("/v1/audit/verify").json()["checked_count"]
+
+    k1, k2 = _bucket(10, 60), _bucket(1, 60)
+    rid = _rid()
+    assert _consume(rid, k1, 2).status_code == 200
+    adj = _rid()
+    assert _adjust(adj, rid, [{"key": k2, "amount": 1}]).status_code == 200
+    assert _adjust(adj, rid, [{"key": k2, "amount": 1}]).status_code == 200  # 重放
+
+    # 不产生审计的分支
+    assert _adjust(_rid(), rid, [{"key": k2, "amount": 5}]).status_code == 429  # 超限
+    assert _adjust(_rid(), rid, [{"key": f"no-{_rid()[:6]}", "amount": 1}]).status_code == 404
+    assert _adjust(_rid(), f"missing-{_rid()}", [{"key": k1, "amount": 1}]).status_code == 404
+    assert _adjust(adj, rid, [{"key": k2, "amount": 2}]).status_code == 409  # 换载荷
+    assert _release(_rid(), rid).status_code == 200
+    assert _adjust(_rid(), rid, [{"key": k1, "amount": 1}]).status_code == 409  # 已释放
+
+    after = client.get("/v1/audit/verify").json()["checked_count"]
+    # consume 放行 1 + adjustment 成功 1 + release 1 = 3
+    assert after - before == 3
+
+    records = _audit(before, 10).json()["records"]
+    rec = [r for r in records if r["event"]["business_id"] == adj]
+    assert len(rec) == 1
+    event = rec[0]["event"]
+    assert event["op"] == "adjustment"
+    assert event["result"] == "adjusted"
+    assert event["business_id"] == adj
+    assert set(event) == {"op", "business_id", "result", "occurred_at"}
+
+
+def test_adjust_validation_errors():
+    key = _bucket(5, 60)
+    rid = _rid()
+    assert _consume(rid, key, 1).status_code == 200
+    # 空 adjustment_id
+    assert client.post("/v1/quota/adjustments", json={
+        "adjustment_id": "", "request_id": rid,
+        "buckets": [{"key": key, "amount": 1}],
+    }).status_code == 422
+    # 空目标列表
+    assert client.post("/v1/quota/adjustments", json={
+        "adjustment_id": _rid(), "request_id": rid, "buckets": [],
+    }).status_code == 422
+    # amount 非正
+    assert _adjust(_rid(), rid, [{"key": key, "amount": 0}]).status_code == 422
+    # 缺少字段
+    assert client.post("/v1/quota/adjustments", json={
+        "adjustment_id": _rid(),
+    }).status_code == 422
+
+
 # ---------------------------------------------------------------- 哈希审计链
 
 def _audit(after_seq: int = 0, limit: int = 1000):
