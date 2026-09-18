@@ -7,7 +7,13 @@
 - request_id 首次出现时固化载荷与判定，重复提交原样返回，
   载荷变化返回 409；
 - 首次判定（放行/拒绝）与首次成功释放在各自原事务内追加一条
-  可校验哈希审计链记录（见 app/audit.py），幂等重放不重复记录。
+  可校验哈希审计链记录（见 app/audit.py），幂等重放不重复记录；
+- POST /v1/quota/adjustments 在单个 BEGIN IMMEDIATE 事务内先排除
+  已放行且未释放请求的原贡献、再按当前桶配置校验目标列表，任一未知
+  桶或超限则原贡献不变，全部通过才原子替换全部用量事件；首次成功
+  调整在原事务追加一条审计记录，同 adjustment_id 同载荷重放原样
+  返回、改换载荷返回 409；
+- 释放撤销的是该请求当前（可能已被调整）的用量贡献。
 """
 from __future__ import annotations
 
@@ -25,7 +31,13 @@ from fastapi.responses import JSONResponse
 from . import audit, config, simulation
 from .db import _rollback_quietly, connect, init_db, seed_buckets
 from .quota import earliest_retry_at, merge_items, payload_hash
-from .schemas import BucketConfig, ConsumeRequest, ReleaseRequest, SimulationRequest
+from .schemas import (
+    AdjustmentRequest,
+    BucketConfig,
+    ConsumeRequest,
+    ReleaseRequest,
+    SimulationRequest,
+)
 
 logger = logging.getLogger("quota")
 
@@ -289,7 +301,7 @@ def _release_consumption(
 ) -> dict:
     """在事务内撤销一个消费请求对所有桶的用量贡献并记录占用关系。"""
     row = conn.execute(
-        "SELECT allowed, payload, release_id FROM requests WHERE request_id = ?",
+        "SELECT allowed, release_id FROM requests WHERE request_id = ?",
         (request_id,),
     ).fetchone()
     if row is None:
@@ -313,8 +325,15 @@ def _release_consumption(
             ),
         )
 
-    payload = json.loads(row["payload"])
-    # 删除该请求对所有桶的用量贡献（与首次扣减写入的事件一一对应）
+    # 撤销该请求当前对所有桶的用量贡献：经调整后贡献来自替换写入的事件，
+    # 故以现存事件为准（调整发生在释放之前，事件与当前贡献一一对应）
+    current = [
+        {"key": r["bucket_key"], "amount": r["amount"]}
+        for r in conn.execute(
+            "SELECT bucket_key, amount FROM usage_events WHERE request_id = ?",
+            (request_id,),
+        ).fetchall()
+    ]
     deleted = conn.execute(
         "DELETE FROM usage_events WHERE request_id = ?",
         (request_id,),
@@ -334,10 +353,248 @@ def _release_consumption(
         "release_id": release_id,
         "request_id": request_id,
         "released": True,
-        "released_buckets": payload["buckets"],
+        "released_buckets": merge_items(current),
         "events_reverted": deleted,
         "released_at": now,
     }
+
+
+# ---------------------------------------------------------------- 配额调整
+
+@app.post("/v1/quota/adjustments")
+def adjust(req: AdjustmentRequest):
+    """把一次已放行且未释放消费的桶用量贡献**原子替换**为目标桶列表。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内：先从窗口用量中排除该请求的原贡献
+    （删除其全部用量事件），再按**当前桶配置**对目标列表逐桶做容量校验；
+    任一目标桶未知或任一桶（在排除原贡献后）仍超限，则整体回滚、原贡献
+    原样保留；全部通过才删除原事件并写入替换事件、固化调整结果，并在
+    同一事务追加一条审计记录。
+
+    - 200：调整成功（或同 adjustment_id + 同载荷重放，原样返回并带
+      X-Idempotent-Replay: true，不重复写审计）；
+    - 404：request_id 不存在 / 存在未配置的目标桶；
+    - 409：request_id 原判定为拒绝 / 已释放 / adjustment_id 已用于
+      不同载荷（含改指其他 request_id）；
+    - 429：目标列表在排除原贡献后仍超限（原贡献不变），含 Retry-After。
+    """
+    now = time.time()
+    items = merge_items([i.model_dump() for i in req.buckets])
+    phash = payload_hash(items)
+    payload_json = json.dumps(
+        {"adjustment_id": req.adjustment_id,
+         "request_id": req.request_id, "buckets": items},
+        sort_keys=True,
+    )
+
+    conn = connect()
+    replayed = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                "SELECT request_id, payload_hash, result FROM adjustments "
+                "WHERE adjustment_id = ?",
+                (req.adjustment_id,),
+            ).fetchone()
+            if existing is not None:
+                # 幂等：同 adjustment_id 必须同 request_id 且同目标载荷，
+                # 原样返回固化结果，不再写库；任一变化返回 409
+                if (
+                    existing["request_id"] != req.request_id
+                    or existing["payload_hash"] != phash
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"adjustment_id '{req.adjustment_id}' 已被不同载荷使用；"
+                            "幂等键不可复用，请更换 adjustment_id"
+                        ),
+                    )
+                result = json.loads(existing["result"])
+                replayed = True
+                conn.execute("COMMIT")
+            else:
+                result = _evaluate_and_adjust(
+                    conn, req.adjustment_id, req.request_id, items, now
+                )
+                if not result["adjusted"]:
+                    # 目标桶超限：不写入替换事件，回滚以保证原贡献不变
+                    conn.execute("ROLLBACK")
+                else:
+                    conn.execute(
+                        "INSERT INTO adjustments "
+                        "(adjustment_id, request_id, payload_hash, payload, "
+                        " result, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            req.adjustment_id,
+                            req.request_id,
+                            phash,
+                            payload_json,
+                            json.dumps(result),
+                            now,
+                        ),
+                    )
+                    # 首次成功调整在同一事务内追加审计；失败（404/409/429）整体
+                    # 回滚、重放走已存在分支，均不记录
+                    audit.append_event(
+                        conn,
+                        op=audit.OP_ADJUST,
+                        business_id=req.adjustment_id,
+                        result=audit.RESULT_ADJUSTED,
+                        occurred_at=now,
+                    )
+                    conn.execute("COMMIT")
+        except Exception:
+            _rollback_quietly(conn)
+            raise
+    finally:
+        conn.close()
+
+    if not result["adjusted"]:
+        # 目标桶超限：原贡献因回滚保持不变，返回与 consume 同形的 429
+        return _adjustment_limited_response(result)
+
+    return JSONResponse(
+        status_code=200,
+        content=result,
+        headers={"X-Idempotent-Replay": "true"} if replayed else {},
+    )
+
+
+def _evaluate_and_adjust(
+    conn: sqlite3.Connection,
+    adjustment_id: str,
+    request_id: str,
+    items: list[dict],
+    now: float,
+) -> dict:
+    """事务内排除原贡献后校验目标列表；全部通过才原子替换全部用量事件。"""
+    row = conn.execute(
+        "SELECT allowed, release_id, created_at FROM requests WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"消费请求 '{request_id}' 不存在，无法调整",
+        )
+    if not row["allowed"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"消费请求 '{request_id}' 原判定为拒绝（429），未发生扣减，不可调整",
+        )
+    if row["release_id"] is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"消费请求 '{request_id}' 已被 release_id '{row['release_id']}' 释放，"
+                "用量贡献已撤销，不可调整"
+            ),
+        )
+
+    # 先从窗口用量中排除该请求的原贡献（当前现存事件；调整为替换语义，
+    # 同一 request_id 至多存在一套事件）
+    old_rows = conn.execute(
+        "SELECT bucket_key, amount FROM usage_events WHERE request_id = ?",
+        (request_id,),
+    ).fetchall()
+    previous = merge_items(
+        [{"key": r["bucket_key"], "amount": r["amount"]} for r in old_rows]
+    )
+    conn.execute("DELETE FROM usage_events WHERE request_id = ?", (request_id,))
+
+    # 再按当前桶配置校验目标列表（此刻窗口用量已不含本请求的原贡献）
+    limited: list[dict] = []
+    for item in items:
+        bucket = conn.execute(
+            "SELECT limit_amount, window_seconds FROM buckets WHERE key = ?",
+            (item["key"],),
+        ).fetchone()
+        if bucket is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"目标桶 '{item['key']}' 未配置，请先通过 "
+                    f"PUT /v1/buckets/{item['key']} 创建"
+                ),
+            )
+
+        limit = bucket["limit_amount"]
+        window = bucket["window_seconds"]
+        events = [
+            (r["created_at"], r["amount"])
+            for r in conn.execute(
+                "SELECT created_at, amount FROM usage_events "
+                "WHERE bucket_key = ? AND created_at > ? ORDER BY created_at",
+                (item["key"], now - window),
+            )
+        ]
+        used = sum(a for _, a in events)
+
+        if used + item["amount"] > limit:
+            retry_at = earliest_retry_at(events, limit, window, item["amount"], now)
+            limited.append(
+                {
+                    "key": item["key"],
+                    "limit": limit,
+                    "window_seconds": window,
+                    "used": used,
+                    "requested": item["amount"],
+                    "retry_at": retry_at,
+                    "retry_after_seconds": (
+                        None if retry_at is None else max(0.0, retry_at - now)
+                    ),
+                }
+            )
+
+    if limited:
+        # 任一超限：不写入替换事件；事务回滚后已删除的原贡献原样恢复
+        retry_times = [b["retry_at"] for b in limited]
+        overall_retry_at = (
+            max(retry_times) if all(t is not None for t in retry_times) else None
+        )
+        return {
+            "adjustment_id": adjustment_id,
+            "request_id": request_id,
+            "adjusted": False,
+            "previous_buckets": previous,
+            "target_buckets": items,
+            "limited_buckets": limited,
+            "retry_at": overall_retry_at,
+            "retry_after_seconds": (
+                None if overall_retry_at is None
+                else max(0.0, overall_retry_at - now)
+            ),
+            "decided_at": now,
+        }
+
+    # 全部通过：原子替换为目标桶事件。沿用原消费的 created_at，使新贡献与
+    # 原贡献在同一滚动窗口时刻生效（与首次扣减事件一一替换）
+    created_at = row["created_at"]
+    for item in items:
+        conn.execute(
+            "INSERT INTO usage_events (bucket_key, request_id, amount, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (item["key"], request_id, item["amount"], created_at),
+        )
+    return {
+        "adjustment_id": adjustment_id,
+        "request_id": request_id,
+        "adjusted": True,
+        "previous_buckets": previous,
+        "buckets": items,
+        "events_replaced": len(items),
+        "adjusted_at": now,
+    }
+
+
+def _adjustment_limited_response(result: dict) -> JSONResponse:
+    """目标桶超限：返回与 consume 同形的 429（含 Retry-After）。"""
+    headers = {}
+    if result.get("retry_after_seconds") is not None:
+        headers["Retry-After"] = str(math.ceil(result["retry_after_seconds"]))
+    return JSONResponse(status_code=429, content=result, headers=headers)
 
 
 # ---------------------------------------------------------------- 回放模拟

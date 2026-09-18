@@ -11,6 +11,10 @@
   （响应头 `X-Idempotent-Replay: true`），内容变化返回 **409**
 - **原子释放**：`POST /v1/quota/releases` 在单事务内撤销一次已放行消费对**所有桶**
   的用量贡献；同一消费只能由一个 `release_id` 释放，重放原样返回
+- **原子调整**：`POST /v1/quota/adjustments` 在单事务内先排除已放行且未释放
+  请求的原贡献、再按当前桶配置校验目标桶列表，任一未知桶或超限则**原贡献不变**，
+  全部通过才原子替换全部用量事件；`adjustment_id` 幂等，同载荷重放原样返回、
+  改换载荷返回 **409**；调整之后释放撤销的是**调整后**的贡献
 - **并发安全**：SQLite `BEGIN IMMEDIATE` 串行化写事务，并发请求不会突破限额
 - **用量查询**：随时查询桶当前窗口用量
 - **哈希审计链**：首次判定（放行/拒绝）与首次成功释放均在各自原事务内追加
@@ -134,7 +138,69 @@ curl -X POST http://localhost:8000/v1/quota/releases \
 释放后重放原 `consume` 仍返回其已固化的判定（带 `X-Idempotent-Replay: true`），
 **不会再次扣减**；恢复出的额度可供新的 `request_id` 使用。
 
-### 4. 查询桶当前窗口用量
+### 4. 调整已放行消费的桶贡献（原子替换）
+
+```bash
+curl -X POST http://localhost:8000/v1/quota/adjustments \
+  -H 'Content-Type: application/json' \
+  -d '{"adjustment_id": "adj-001", "request_id": "req-001",
+       "buckets": [{"key": "heavy-jobs", "amount": 1}]}'
+```
+
+在**单个 `BEGIN IMMEDIATE` 事务**内完成：
+
+1. 校验 `request_id` 存在、原判定为放行且尚未释放；
+2. **先从窗口用量中排除该请求的原贡献**（删除其全部用量事件）；
+3. 再按**当前桶配置**对目标桶列表逐桶做容量校验；
+4. 任一目标桶未知或任一桶（在排除原贡献后）仍超限 → **整体回滚，原贡献原样保留**；
+5. 全部通过才写入替换事件（沿用原消费时间戳）、固化调整结果，并在**同一事务**
+   追加一条 `adjust/adjusted` 审计记录。
+
+成功（`200`）：
+
+```json
+{"adjustment_id": "adj-001", "request_id": "req-001",
+ "adjusted": true,
+ "previous_buckets": [{"key": "api-requests", "amount": 1},
+                      {"key": "llm-tokens", "amount": 500}],
+ "buckets": [{"key": "heavy-jobs", "amount": 1}],
+ "events_replaced": 1,
+ "adjusted_at": 1789657750.12}
+```
+
+超限（`429`，含 `Retry-After`；原贡献**不发生任何变化**）：
+
+```json
+{"adjustment_id": "adj-002", "request_id": "req-001",
+ "adjusted": false,
+ "previous_buckets": [{"key": "api-requests", "amount": 1}],
+ "target_buckets": [{"key": "heavy-jobs", "amount": 2}],
+ "limited_buckets": [{"key": "heavy-jobs", "limit": 5, "window_seconds": 300,
+                      "used": 4, "requested": 2,
+                      "retry_at": 1789657900.0, "retry_after_seconds": 150.0}],
+ "retry_at": 1789657900.0, "retry_after_seconds": 150.0,
+ "decided_at": 1789657750.0}
+```
+
+调整语义：
+
+| 场景 | 结果 |
+| --- | --- |
+| 相同 `adjustment_id` + 相同载荷重放 | `200`，原样返回首次调整结果，响应头 `X-Idempotent-Replay: true`，不重复替换、不重复写审计 |
+| 相同 `adjustment_id` 改换载荷（含改指其他 `request_id`） | `409` |
+| 目标列表含未配置桶 | `404`，原贡献保留 |
+| 排除原贡献后目标桶仍超限 | `429`，原贡献保留（事务回滚） |
+| `request_id` 不存在 / 原判定为拒绝 / 已释放 | `404` / `409` / `409` |
+| 同一消费用**不同** `adjustment_id` 连续调整 | 允许；每次基于上一次调整后的现存贡献再次替换 |
+
+> 校验目标桶时该请求的原贡献已被排除，因此把同一桶的贡献从 5 下调到 2 不会
+> 被自己挡住；`429` 不固化任何结果，额度释放后同一 `adjustment_id` 可重试成功。
+
+调整之后再调用释放接口，撤销的是**调整后的贡献**（以现存用量事件为准），
+返回的 `released_buckets` 也是调整后的桶列表；调整后重放原 `consume` 仍只返回
+首次判定、不重新扣减原桶。
+
+### 5. 查询桶当前窗口用量
 
 ```bash
 curl http://localhost:8000/v1/buckets/llm-tokens/usage
@@ -147,12 +213,12 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
  "oldest_event_expires_at": 1789657717.47}
 ```
 
-### 5. 哈希审计链
+### 6. 哈希审计链
 
-每次**首次消费判定**（放行 `200` 或拒绝 `429`）与**首次成功释放**，都在
-各自的原写事务内（同提交、同回滚）向仅追加的 `audit_log` 追加一条记录；
-幂等重放直接返回固化结果，**不重复记录**；失败的释放（`404`/`409`）
-事务回滚，也不会留痕。
+每次**首次消费判定**（放行 `200` 或拒绝 `429`）、**首次成功释放**与**首次成功
+调整**，都在各自的原写事务内（同提交、同回滚）向仅追加的 `audit_log` 追加一条
+记录；幂等重放直接返回固化结果，**不重复记录**；失败的释放/调整
+（`404`/`409`/`429`）事务回滚，也不会留痕。
 
 链规则：
 
@@ -163,10 +229,10 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 
 | 字段 | 含义 |
 | --- | --- |
-| `op` | 操作类型：`consume`（消费判定）/ `release`（成功释放） |
-| `business_id` | 业务 ID：`consume` 取 `request_id`，`release` 取 `release_id` |
-| `result` | 结果：`allowed` / `denied` / `released` |
-| `occurred_at` | 发生时间（epoch 秒，与判定/释放时刻一致） |
+| `op` | 操作类型：`consume`（消费判定）/ `release`（成功释放）/ `adjust`（成功调整） |
+| `business_id` | 业务 ID：`consume` 取 `request_id`，`release` 取 `release_id`，`adjust` 取 `adjustment_id` |
+| `result` | 结果：`allowed` / `denied` / `released` / `adjusted` |
+| `occurred_at` | 发生时间（epoch 秒，与判定/释放/调整时刻一致） |
 
 按 `seq` 翻页查询（游标为上次最后一条的 `seq`，响应同时给出当前链头）：
 
@@ -211,7 +277,7 @@ curl http://localhost:8000/v1/audit/verify
 
 发现篡改/断链时 `valid` 为 `false`，`first_invalid_seq` 给出最早失配记录的 `seq`。
 
-### 6. 历史回放模拟（候选配置试算）
+### 7. 历史回放模拟（候选配置试算）
 
 评估"如果桶当时用的是另一套 limit/window 配置，历史消费的判定会怎样变化"。
 接口在**隔离内存**中重算，**只读**数据库（桶配置 + 首次消费固化记录），
@@ -292,6 +358,7 @@ curl -X POST http://localhost:8000/v1/quota/simulations \
 | --- | --- | --- |
 | `POST` | `/v1/quota/consume` | 多桶检查 + 扣减；`200` 放行 / `429` 超限 / `409` 幂等冲突 / `404` 桶未配置 |
 | `POST` | `/v1/quota/releases` | 释放一次已放行消费；`200` 成功或重放 / `409` 冲突 / `404` 原请求不存在 |
+| `POST` | `/v1/quota/adjustments` | 原子替换一次已放行且未释放消费的桶贡献；`200` 成功或重放 / `429` 目标超限（原贡献保留） / `409` 幂等冲突或请求不可调整 / `404` 原请求或目标桶不存在 |
 | `POST` | `/v1/quota/simulations` | 隔离内存回放历史消费评估候选配置；`200` 试算结果 / `422` 未知桶、非法范围或跨度超 7 天 |
 | `GET` | `/v1/buckets/{key}/usage` | 查询桶当前滚动窗口用量 |
 | `PUT` | `/v1/buckets/{key}` | 创建或更新桶（`limit`、`window_seconds`） |
@@ -315,18 +382,31 @@ curl -X POST http://localhost:8000/v1/quota/simulations \
 - **原子性**：`consume` 在单个 `BEGIN IMMEDIATE` 事务内完成"读窗口用量 → 判定 →
   写扣减事件 → 固化判定"，任一环节失败整体回滚。`release` 同理：在单个写事务内
   完成"校验原请求 → 删除其全部 `usage_events` → 标记 `requests.release_id`
-  → 写入 `releases` 释放记录"，保证所有桶同时恢复。
+  → 写入 `releases` 释放记录"，保证所有桶同时恢复。`adjust` 在单个写事务内
+  完成"校验原请求（放行且未释放）→ 删除原贡献事件 → 按当前配置校验目标列表
+  → 写入替换事件 → 写入 `adjustments` 记录"；校验发生在原贡献删除**之后**
+  （从而原贡献不会挡住目标桶），任一未知桶/超限即 `ROLLBACK`，已删除的原贡献
+  随回滚完整恢复，成功时替换事件沿用原消费 `created_at` 使窗口时刻保持一致。
 - **并发**：`BEGIN IMMEDIATE` 使写事务在数据库级串行化；WAL 模式保证读（用量查询）不阻塞。
   多个不同 `release_id` 并发释放同一消费时，事务串行化 + 占用标记保证仅一个成功，
-  其余返回 `409`。
+  其余返回 `409`。多个不同 `adjustment_id` 并发调整同一消费时按顺序串行替换，
+  每笔都基于上一笔提交后的现存贡献做排除与校验，贡献不会叠加、限额不会被突破。
 - **幂等**：`requests` 表以 `request_id` 为主键，固化载荷 SHA-256 与判定 JSON；
   重放命中时直接返回，哈希不一致返回 409。`releases` 表以 `release_id` 为主键固化
   目标 `request_id` 与释放结果：同目标重放原样返回并带 `X-Idempotent-Replay: true`，
-  改指其他目标返回 409。
+  改指其他目标返回 409。`adjustments` 表以 `adjustment_id` 为主键固化完整载荷
+  （含 `request_id` 与规范化目标桶列表）的哈希与调整结果，同载荷重放原样返回、
+  任何载荷变化（含改指 `request_id`）返回 409；`429` 超限不写幂等表，可在额度
+  释放后以同一 `adjustment_id` 重试。
+- **释放与调整的关系**：调整只替换 `usage_events`、不改写 `requests` 中固化的
+  首次判定，故释放以现存事件为准撤销**当前（可能已被调整）的贡献**，
+  `released_buckets` 同样由现存事件汇总；调整后重放原 `consume` 仍命中固化判定，
+  不会把已搬走的贡献重新扣回原桶。
 - **审计链**：`audit_log` 为仅追加表，`seq` 由 SQLite AUTOINCREMENT 全局递增。
-  首次判定在固化 `requests` 之后、首次成功释放在写入 `releases` 之后，于**同一
-  `BEGIN IMMEDIATE` 事务**内追加审计记录——业务回滚则审计不生效，二者不可能分离；
-  幂等重放走不写入审计的独立分支。追加时先读链尾 `hash` 作为 `prev_hash`，按
+  首次判定在固化 `requests` 之后、首次成功释放在写入 `releases` 之后、首次成功
+  调整在写入 `adjustments` 之后，于**同一 `BEGIN IMMEDIATE` 事务**内追加审计
+  记录——业务回滚则审计不生效，二者不可能分离；幂等重放走不写入审计的独立分支。
+  追加时先读链尾 `hash` 作为 `prev_hash`，按
   `SHA-256(bytes.fromhex(prev_hash) + canonical_json(event))` 计算当前 `hash`，
   写事务串行化保证链头读取与追加之间无并发分叉。`GET /v1/audit/verify` 从 64 个 0
   的创世前序哈希起逐条重算，同时核对 `seq` 连续性，报告首个失配位置。
@@ -350,9 +430,15 @@ python -m pytest tests/ -q
 覆盖：原子扣减、幂等重放（含拒绝判定重放）、409 冲突、滚动窗口过期恢复、
 50 并发不超限额、同 `request_id` 并发只扣减一次，以及释放接口的多桶原子恢复、
 幂等重放、改指冲突、重复释放冲突、404/409 分支、释放后 consume 重放不再次扣减、
-20 并发释放仅一个成功；此外覆盖哈希审计链的哈希规则纯函数、首条锚定 64 个 0、
-放行/拒绝/成功释放仅记一次且重放不重复、失败释放与 409/404 不留痕、分页与链头、
-全链校验有效与篡改检出（事件内容/前序指针），以及回放模拟的四类转移计数、
-候选覆盖与沿用当前配置、窗口收缩导致的 deny→allow、多桶全拒不占用、
+20 并发释放仅一个成功；调整接口覆盖跨桶/多桶/同桶原子替换、原贡献排除校验、
+未知桶 404 与超限 429 均保持原贡献（含 `Retry-After`/`retry_at=null`）、
+同载荷重放原样返回不重复写审计、换载荷/改指请求 409、原单不存在/被拒/已释放
+分支、不同 ID 连续调整基于现存贡献、429 后额度释放可重试、调整后释放撤销的是
+调整后贡献、调整后 consume 重放不重新扣减、20 并发同 ID 只应用一次与不同 ID
+串行替换不叠加、调整与消费并发不超限、成功调整仅记一条审计且全部失败分支不留痕；
+此外覆盖哈希审计链的哈希规则纯函数、首条锚定 64 个 0、
+放行/拒绝/成功释放/成功调整仅记一次且重放不重复、失败释放与 409/404 不留痕、
+分页与链头、全链校验有效与篡改检出（事件内容/前序指针），以及回放模拟的四类转移
+计数、候选覆盖与沿用当前配置、窗口收缩导致的 deny→allow、多桶全拒不占用、
 预热边界与峰值、release 不回放、稳定顺序与 100 条截断、只读不留痕、
-422 校验分支与已删除桶陈旧载荷，共 48 个用例。
+422 校验分支与已删除桶陈旧载荷，共 71 个用例。

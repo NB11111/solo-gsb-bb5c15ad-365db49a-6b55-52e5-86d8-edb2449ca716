@@ -51,6 +51,18 @@ CREATE TABLE IF NOT EXISTS releases (
     created_at  REAL    NOT NULL
 );
 
+-- 调整幂等表：adjustment_id 首次成功调整时固化完整载荷哈希与调整结果。
+-- 调整语义为"替换"：成功后该请求对各桶的用量贡献以 payload 中的
+-- 目标桶列表为准（原贡献事件已在同事务中被原子删除替换）。
+CREATE TABLE IF NOT EXISTS adjustments (
+    adjustment_id TEXT PRIMARY KEY,
+    request_id    TEXT    NOT NULL,
+    payload_hash  TEXT    NOT NULL,
+    payload       TEXT    NOT NULL,
+    result        TEXT    NOT NULL,
+    created_at    REAL    NOT NULL
+);
+
 -- 哈希审计链：仅追加。seq 全局递增，首条 prev_hash 为 64 个 0，
 -- hash = SHA-256(prev_hash 的原始32字节 + canonical JSON 事件)
 CREATE TABLE IF NOT EXISTS audit_log (

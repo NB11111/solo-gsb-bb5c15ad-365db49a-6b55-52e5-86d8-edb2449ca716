@@ -25,10 +25,12 @@ GENESIS_HASH = "0" * 64
 
 OP_CONSUME = "consume"
 OP_RELEASE = "release"
+OP_ADJUST = "adjust"
 
 RESULT_ALLOWED = "allowed"
 RESULT_DENIED = "denied"
 RESULT_RELEASED = "released"
+RESULT_ADJUSTED = "adjusted"
 
 
 def canonical_event_json(event: dict[str, Any]) -> str:
